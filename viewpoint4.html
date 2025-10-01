@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>【修正版】視線方向推定デモ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <style>
+        body {
+            background-color: #111827; /* bg-gray-900 */
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            max-width: 960px;
+            margin: auto;
+            background-color: #000;
+            border-radius: 0.5rem;
+            overflow: hidden;
+        }
+        #video, #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border-radius: 0.5rem;
+        }
+        #video.mirrored {
+            transform: scaleX(-1); /* Webcam mirror */
+        }
+    </style>
+</head>
+<body class="text-white font-sans">
+
+    <div class="container mx-auto p-4 max-w-7xl">
+        <div class="text-center mb-6">
+            <h1 class="text-3xl md:text-4xl font-bold">【位置ズレ修正版】視線方向推定デモ</h1>
+            <p class="text-gray-400 mt-2" id="status">モデルを読み込み中...</p>
+        </div>
+
+        <div class="grid grid-cols-1 gap-6">
+            <div class="bg-gray-800 p-4 rounded-lg shadow-2xl">
+                <div class="video-container mb-4 shadow-inner">
+                    <video id="video" playsinline muted loop></video>
+                    <canvas id="overlay"></canvas>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-4 max-w-md mx-auto">
+                    <button id="webcamButton" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg transition-colors duration-300">Webカメラを開始</button>
+                    <label for="videoFileInput" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition-colors duration-300 cursor-pointer text-center">
+                        動画ファイルを選択
+                    </label>
+                    <input type="file" id="videoFileInput" accept="video/*" class="hidden">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const videoContainer = document.querySelector('.video-container');
+        const webcamButton = document.getElementById('webcamButton');
+        const videoFileInput = document.getElementById('videoFileInput');
+        const statusText = document.getElementById('status');
+        
+        let modelsLoaded = false;
+        let detectionLoopId;
+        const SMOOTHING_FACTOR = 0.15;
+        let faceStates = [];
+
+        async function loadModels() {
+            const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+            try {
+                await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+                await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+                modelsLoaded = true;
+                statusText.textContent = '準備完了。ソースを選択してください。';
+            } catch (error) {
+                console.error("モデルの読み込みに失敗:", error);
+                statusText.textContent = 'モデルの読み込みに失敗しました。';
+            }
+        }
+        
+        // ビデオのアスペクト比に合わせてコンテナとキャンバスのサイズを調整する関数
+        function updateOverlaySize() {
+            if (!video.videoWidth) return; 
+
+            const videoAspectRatio = video.videoHeight / video.videoWidth;
+            const containerWidth = videoContainer.clientWidth;
+            const newHeight = containerWidth * videoAspectRatio;
+
+            videoContainer.style.height = `${newHeight}px`;
+            const displaySize = { width: containerWidth, height: newHeight };
+            faceapi.matchDimensions(overlay, displaySize);
+        }
+
+        webcamButton.addEventListener('click', () => {
+            if (!modelsLoaded) return;
+            video.classList.add('mirrored');
+            startVideo(true);
+        });
+
+        videoFileInput.addEventListener('change', (event) => {
+            // 修正点: event.target.files[0] を正しく参照する
+            if (!modelsLoaded || !event.target.files || event.target.files.length === 0) return;
+            video.classList.remove('mirrored');
+            const file = event.target.files[0];
+            const url = URL.createObjectURL(file);
+            video.src = url;
+            startVideo(false);
+        });
+
+        function startVideo(isWebcam) {
+            const videoSource = isWebcam ? navigator.mediaDevices.getUserMedia({ video: {} }) : Promise.resolve();
+            
+            videoSource.then(stream => {
+                if (isWebcam && stream) {
+                    video.srcObject = stream;
+                }
+                video.play();
+            }).catch(err => {
+                console.error("ビデオの開始に失敗:", err);
+                statusText.textContent = 'ビデオの開始に失敗しました。';
+            });
+        }
+        
+        video.addEventListener('play', () => {
+            setTimeout(() => {
+                updateOverlaySize();
+                if (detectionLoopId) {
+                    cancelAnimationFrame(detectionLoopId);
+                }
+                faceStates = [];
+                detectionLoop();
+            }, 100);
+        });
+        
+        async function detectionLoop() {
+            detectionLoopId = requestAnimationFrame(detectionLoop);
+
+            try {
+                if (video.paused || video.ended || !modelsLoaded) return;
+                
+                const detections = await faceapi.detectAllFaces(video, new faceapi.SsdMobilenetv1Options()).withFaceLandmarks();
+                
+                const ctx = overlay.getContext('2d');
+                ctx.clearRect(0, 0, overlay.width, overlay.height);
+                
+                const displaySize = { width: overlay.width, height: overlay.height };
+                const resizedDetections = faceapi.resizeResults(detections, displaySize);
+
+                while (faceStates.length < resizedDetections.length) {
+                    faceStates.push({
+                        smoothedPose: { yaw: 0, pitch: 0, roll: 0 },
+                        isFirstPose: true
+                    });
+                }
+                while (faceStates.length > resizedDetections.length) {
+                    faceStates.pop();
+                }
+
+                ctx.save();
+                if (video.classList.contains('mirrored')) {
+                    ctx.scale(-1, 1);
+                    ctx.translate(-overlay.width, 0);
+                }
+                resizedDetections.forEach(detection => {
+                    faceapi.draw.drawFaceLandmarks(overlay, detection);
+                });
+                ctx.restore();
+
+                resizedDetections.forEach((detection, i) => {
+                    // 修正点: 各顔に対応する state を正しく取得する
+                    const state = faceStates[i];
+                    const pose = estimateHeadPose(detection.landmarks);
+                    
+                    if (pose) {
+                        if (state.isFirstPose) {
+                            state.smoothedPose = pose;
+                            state.isFirstPose = false;
+                        } else {
+                            state.smoothedPose.yaw = SMOOTHING_FACTOR * pose.yaw + (1 - SMOOTHING_FACTOR) * state.smoothedPose.yaw;
+                            state.smoothedPose.pitch = SMOOTHING_FACTOR * pose.pitch + (1 - SMOOTHING_FACTOR) * state.smoothedPose.pitch;
+                            state.smoothedPose.roll = SMOOTHING_FACTOR * pose.roll + (1 - SMOOTHING_FACTOR) * state.smoothedPose.roll;
+                        }
+                        
+                        drawGazeLine(detection.landmarks, state.smoothedPose, ctx);
+                    }
+                });
+
+            } catch (error) {
+                console.error("Detection loop error:", error);
+            }
+        }
+
+        function estimateHeadPose(landmarks) {
+            try {
+                const leftEye = landmarks.getLeftEye();
+                const rightEye = landmarks.getRightEye();
+                const nose = landmarks.getNose();
+                const jaw = landmarks.getJawOutline();
+                // 修正点: 各パーツの座標が正しく取得できているか詳細にチェックする
+                if (!leftEye || !rightEye || !nose || !jaw || jaw.length < 17 || !leftEye[0] || !rightEye[3] || !nose[3] || !jaw[8] || !jaw[16] || !jaw[0]) return null;
+                
+                const eyeMidPoint = { x: (leftEye[0].x + rightEye[3].x) / 2, y: (leftEye[0].y + rightEye[3].y) / 2 };
+                const noseTip = nose[3];
+                const chin = jaw[8];
+                const faceWidth = jaw[16].x - jaw[0].x;
+
+                const noseToCenterDist = noseTip.x - (jaw[0].x + faceWidth / 2);
+                const yaw = Math.PI * (noseToCenterDist / (faceWidth / 2 || 1)) * 0.8;
+
+                const eyeToNoseDist = noseTip.y - eyeMidPoint.y;
+                const noseToChinDist = chin.y - noseTip.y;
+                const pitch = (eyeToNoseDist / (noseToChinDist || 1) - 0.75) * 0.8;
+
+                // rollは計算が複雑なため、このデモではyawとpitchのみ返す
+                return { yaw, pitch };
+            } catch (e) {
+                console.error("Error in estimateHeadPose", e);
+                return null;
+            }
+        }
+        
+        function drawGazeLine(landmarks, pose, ctx) {
+            const leftEye = landmarks.getLeftEye();
+            const rightEye = landmarks.getRightEye();
+            // 修正点: 目の座標が正しく取得できているかチェックする
+            if (!leftEye || !rightEye || !leftEye[3] || !rightEye[0]) return;
+
+            const startPoint = {
+                x: (leftEye[3].x + rightEye[0].x) / 2,
+                y: (leftEye[3].y + rightEye[0].y) / 2
+            };
+
+            const lineLength = 150;
+            const yaw = video.classList.contains('mirrored') ? -pose.yaw : pose.yaw;
+            const endPoint = {
+                x: startPoint.x + Math.tan(yaw) * lineLength,
+                y: startPoint.y + Math.tan(pose.pitch) * lineLength
+            };
+
+            ctx.beginPath();
+            ctx.moveTo(startPoint.x, startPoint.y);
+            ctx.lineTo(endPoint.x, endPoint.y);
+            ctx.strokeStyle = 'rgba(14, 233, 165, 0.9)';
+            // 修正点: 線の太さを5に変更
+            ctx.lineWidth = 5;
+            ctx.stroke();
+        }
+
+        loadModels();
+        window.addEventListener('resize', updateOverlaySize);
+    </script>
+</body>
+</html>

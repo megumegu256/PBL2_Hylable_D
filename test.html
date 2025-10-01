@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>高精度 視線・頭部姿勢推定デモ（安定化最終版）</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <style>
+        body {
+            background-color: #111827; /* bg-gray-900 */
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            padding-top: 75%; /* 4:3 Aspect Ratio */
+            background-color: #000;
+            border-radius: 0.5rem;
+        }
+        #video, #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border-radius: 0.5rem;
+        }
+        #video.mirrored {
+            transform: scaleX(-1); /* Webcam mirror */
+        }
+    </style>
+</head>
+<body class="text-white font-sans">
+
+    <div class="container mx-auto p-4 max-w-7xl">
+        <div class="text-center mb-6">
+            <h1 class="text-3xl md:text-4xl font-bold">高精度 視線・頭部姿勢推定デモ</h1>
+            <p class="text-gray-400 mt-2">エラーハンドリングを強化し、安定性を向上させました。</p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- Left Panel: Video and Controls -->
+            <div class="bg-gray-800 p-4 rounded-lg shadow-2xl">
+                <div class="video-container mb-4 shadow-inner">
+                    <video id="video" playsinline muted loop></video>
+                    <canvas id="overlay"></canvas>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-4">
+                    <button id="webcamButton" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg transition-colors duration-300">Webカメラを開始</button>
+                    <label for="videoFileInput" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition-colors duration-300 cursor-pointer text-center">
+                        動画ファイルを選択
+                    </label>
+                    <input type="file" id="videoFileInput" accept="video/*" class="hidden">
+                </div>
+            </div>
+
+            <!-- Right Panel: 3D Visualization -->
+            <div id="three-container" class="bg-gray-800 p-4 rounded-lg shadow-2xl min-h-[300px] md:min-h-0">
+                 <p id="status" class="text-gray-400 text-center">モデルを読み込み中...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const webcamButton = document.getElementById('webcamButton');
+        const videoFileInput = document.getElementById('videoFileInput');
+        const threeContainer = document.getElementById('three-container');
+        const statusText = document.getElementById('status');
+        
+        let modelsLoaded = false;
+        let scene, camera, renderer, head, gazeLine;
+        const SMOOTHING_FACTOR = 0.15;
+        let smoothedPose = { yaw: 0, pitch: 0, roll: 0 };
+        let isFirstPose = true;
+        const GAZE_SENSITIVITY = 400;
+
+        async function loadModels() {
+            const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+            try {
+                await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+                await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+                modelsLoaded = true;
+                statusText.textContent = '準備完了。ソースを選択してください。';
+            } catch (error) {
+                console.error("モデルの読み込みに失敗:", error);
+                statusText.textContent = 'モデルの読み込みに失敗しました。';
+            }
+        }
+
+        function initThreeScene() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, threeContainer.clientWidth / threeContainer.clientHeight, 0.1, 1000);
+            camera.position.z = 30;
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(threeContainer.clientWidth, threeContainer.clientHeight);
+            threeContainer.innerHTML = '';
+            threeContainer.appendChild(renderer.domElement);
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(0, 1, 1);
+            scene.add(directionalLight);
+            const headGeometry = new THREE.BoxGeometry(10, 12, 10);
+            const headMaterial = new THREE.MeshStandardMaterial({ color: 0x2563eb, roughness: 0.5 });
+            head = new THREE.Mesh(headGeometry, headMaterial);
+            scene.add(head);
+            const gazeMaterial = new THREE.LineBasicMaterial({ color: 0x0ea5e9, linewidth: 2 });
+            const gazePoints = [new THREE.Vector3(0, 2, 5), new THREE.Vector3(0, 2, 50)];
+            const gazeGeometry = new THREE.BufferGeometry().setFromPoints(gazePoints);
+            gazeLine = new THREE.Line(gazeGeometry, gazeMaterial);
+            head.add(gazeLine);
+            window.addEventListener('resize', onWindowResize, false);
+        }
+        
+        function onWindowResize() {
+            if (!renderer) return;
+            camera.aspect = threeContainer.clientWidth / threeContainer.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(threeContainer.clientWidth, threeContainer.clientHeight);
+        }
+
+        webcamButton.addEventListener('click', () => {
+            if (!modelsLoaded) return;
+            video.classList.add('mirrored');
+            startVideo(true);
+        });
+
+        videoFileInput.addEventListener('change', (event) => {
+            if (!modelsLoaded || !event.target.files || event.target.files.length === 0) return;
+            video.classList.remove('mirrored');
+            const file = event.target.files[0];
+            const url = URL.createObjectURL(file);
+            video.src = url;
+            startVideo(false);
+        });
+
+        function startVideo(isWebcam) {
+            const videoSource = isWebcam ? navigator.mediaDevices.getUserMedia({ video: {} }) : Promise.resolve();
+            
+            videoSource.then(stream => {
+                if (isWebcam) {
+                    video.srcObject = stream;
+                }
+                video.play();
+            }).catch(err => {
+                console.error("ビデオの開始に失敗:", err);
+                statusText.textContent = 'ビデオの開始に失敗しました。';
+            });
+        }
+        
+        video.addEventListener('play', () => {
+            if (!scene) initThreeScene();
+            
+            const displaySize = { width: video.clientWidth, height: video.clientHeight };
+            faceapi.matchDimensions(overlay, displaySize);
+
+            requestAnimationFrame(detectionLoop);
+        });
+        
+        async function detectionLoop() {
+            try {
+                if (video.paused || video.ended) {
+                    return;
+                }
+                
+                const detections = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks();
+                const ctx = overlay.getContext('2d');
+                ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+                if (detections && detections.landmarks) {
+                    const resizedDetections = faceapi.resizeResults(detections, { width: overlay.width, height: overlay.height });
+                    faceapi.draw.drawFaceLandmarks(overlay, resizedDetections);
+
+                    const pose = estimateHeadPose(resizedDetections.landmarks);
+                    
+                    if (pose) {
+                        if (isFirstPose) {
+                            smoothedPose = pose;
+                            isFirstPose = false;
+                        } else {
+                            smoothedPose.yaw = SMOOTHING_FACTOR * pose.yaw + (1 - SMOOTHING_FACTOR) * smoothedPose.yaw;
+                            smoothedPose.pitch = SMOOTHING_FACTOR * pose.pitch + (1 - SMOOTHING_FACTOR) * smoothedPose.pitch;
+                            smoothedPose.roll = SMOOTHING_FACTOR * pose.roll + (1 - SMOOTHING_FACTOR) * smoothedPose.roll;
+                        }
+
+                        head.rotation.y = -smoothedPose.yaw;
+                        head.rotation.x = smoothedPose.pitch;
+                        head.rotation.z = -smoothedPose.roll;
+                        
+                        drawGazePointOnOverlay(resizedDetections.landmarks, smoothedPose, ctx);
+                    }
+                } else {
+                    isFirstPose = true;
+                }
+
+                if(renderer && scene && camera) {
+                    renderer.render(scene, camera);
+                }
+
+            } catch (error) {
+                console.error("Detection loop error:", error);
+            } finally {
+                // エラーが発生しても、次のフレームを要求する
+                requestAnimationFrame(detectionLoop);
+            }
+        }
+
+        function estimateHeadPose(landmarks) {
+            try {
+                const leftEye = landmarks.getLeftEye();
+                const rightEye = landmarks.getRightEye();
+                const nose = landmarks.getNose();
+                const jaw = landmarks.getJawOutline();
+
+                // 計算に必要なランドマークがすべて存在するかチェック
+                if (!leftEye || !rightEye || !nose || !jaw || jaw.length < 17 || !leftEye[0] || !rightEye[3] || !nose[3] || !jaw[8] || !jaw[16]) {
+                    return null; // 必要な点がなければnullを返す
+                }
+
+                const eyeMidPoint = { x: (leftEye[0].x + rightEye[3].x) / 2, y: (leftEye[0].y + rightEye[3].y) / 2 };
+                const roll = Math.atan2(rightEye[3].y - leftEye[0].y, rightEye[3].x - leftEye[0].x);
+                const noseTip = nose[3];
+                const chin = jaw[8];
+                const eyeToNoseDist = noseTip.y - eyeMidPoint.y;
+                const noseToChinDist = chin.y - noseTip.y;
+                const pitch = (eyeToNoseDist / (noseToChinDist || 1) - 0.75) * 0.8;
+                const faceWidth = jaw[16].x - jaw[0].x;
+                const noseToCenterDist = noseTip.x - (jaw[0].x + faceWidth / 2);
+                const yaw = Math.PI * (noseToCenterDist / (faceWidth / 2 || 1)) * 0.8;
+                return { yaw, pitch, roll };
+            } catch (e) {
+                console.error("Error in estimateHeadPose", e);
+                return null;
+            }
+        }
+
+        function drawGazePointOnOverlay(landmarks, pose, ctx) {
+            const leftEye = landmarks.getLeftEye();
+            const rightEye = landmarks.getRightEye();
+            const eyeMidPoint = {
+                x: (leftEye[0].x + rightEye[3].x) / 2,
+                y: (leftEye[0].y + rightEye[3].y) / 2
+            };
+
+            const offsetX = Math.tan(pose.yaw) * GAZE_SENSITIVITY;
+            const offsetY = Math.tan(pose.pitch) * GAZE_SENSITIVITY;
+
+            const gazeX = eyeMidPoint.x + (video.classList.contains('mirrored') ? -offsetX : offsetX);
+            const gazeY = eyeMidPoint.y + offsetY;
+
+            ctx.beginPath();
+            ctx.arc(gazeX, gazeY, 10, 0, 2 * Math.PI);
+            ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+
+        loadModels();
+    </script>
+</body>
+</html>

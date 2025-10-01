@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>【最終修正版】Holistic 高精度視線推定</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js" crossorigin="anonymous"></script>
+    <style>
+        body { background-color: #111827; }
+        .canvas-container {
+            position: relative;
+            width: 100%;
+            max-width: 960px;
+            margin: auto;
+            border-radius: 0.5rem;
+            overflow: hidden;
+            background-color: #000;
+        }
+        #output_canvas {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+    </style>
+</head>
+<body class="text-white font-sans">
+
+    <div class="container mx-auto p-4 max-w-7xl">
+        <div class="text-center mb-6">
+            <h1 class="text-3xl md:text-4xl font-bold">【最終修正版】Holistic 高精度視線推定</h1>
+            <p class="text-gray-400 mt-2" id="status">AIモデルを読み込み中...</p>
+        </div>
+
+        <div class="canvas-container shadow-2xl">
+            <video id="input_video" loop style="display: none;"></video>
+            <canvas id="output_canvas"></canvas>
+        </div>
+
+        <div class="flex flex-col sm:flex-row gap-4 max-w-md mx-auto mt-6">
+            <button id="webcamButton" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg transition-colors duration-300">Webカメラを開始</button>
+            <label for="videoFileInput" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition-colors duration-300 cursor-pointer text-center">
+                動画ファイルを選択
+            </label>
+            <input type="file" id="videoFileInput" accept="video/*" class="hidden">
+        </div>
+    </div>
+
+    <script type="module">
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const statusText = document.getElementById('status');
+        const webcamButton = document.getElementById('webcamButton');
+        const videoFileInput = document.getElementById('videoFileInput');
+
+        let isMirrored = false;
+        let activeStream = false;
+
+        function onResults(results) {
+            statusText.textContent = '姿勢を検出中...';
+
+            const canvasWidth = results.image.width;
+            const canvasHeight = results.image.height;
+            canvasElement.width = canvasWidth;
+            canvasElement.height = canvasHeight;
+
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+            // ミラー表示の場合は、描画コンテキスト全体を反転させる
+            if (isMirrored) {
+                canvasCtx.translate(canvasWidth, 0);
+                canvasCtx.scale(-1, 1);
+            }
+            
+            // 背景画像を描画
+            canvasCtx.drawImage(results.image, 0, 0, canvasWidth, canvasHeight);
+            
+            // 各種ランドマークを描画
+            if (results.poseLandmarks) {
+                drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, { color: '#CCCCCC', lineWidth: 2 });
+            }
+            if(results.faceLandmarks) {
+                drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_TESSELATION, {color: '#4ade80', lineWidth: 1});
+            }
+            
+            // ★★★ 新しいロジックで視線データを取得 ★★★
+            const gazeData = getGazeData(results);
+            if (gazeData) {
+                drawGazeIndicator(gazeData, canvasCtx);
+            }
+            
+            canvasCtx.restore();
+        }
+        
+        // ★★★ 視線推定ロジックの全面書き換え ★★★
+        function getGazeData(results) {
+            // 画面上の2D座標と、仮想空間の3D座標の両方が必要
+            if (!results.poseLandmarks || !results.poseWorldLandmarks) {
+                return null;
+            }
+
+            // 必要な点の参照を取得
+            const screenNose = results.poseLandmarks[0];       // 鼻先 (2D)
+            const worldNose = results.poseWorldLandmarks[0];       // 鼻先 (3D)
+            const worldLeftEar = results.poseWorldLandmarks[7];  // 左耳 (3D)
+            const worldRightEar = results.poseWorldLandmarks[8]; // 右耳 (3D)
+
+            // 必要な点の検出精度が十分か確認
+            if (screenNose.visibility < 0.8 || worldNose.visibility < 0.8 || worldLeftEar.visibility < 0.8 || worldRightEar.visibility < 0.8) {
+                return null;
+            }
+
+            // Three.jsのVector3を使って3D計算を行う
+            const vNose = new THREE.Vector3(worldNose.x, worldNose.y, worldNose.z);
+            const vLeftEar = new THREE.Vector3(worldLeftEar.x, worldLeftEar.y, worldLeftEar.z);
+            const vRightEar = new THREE.Vector3(worldRightEar.x, worldRightEar.y, worldRightEar.z);
+
+            // 顔平面上の2つのベクトルを生成
+            const vEarToEar = new THREE.Vector3().subVectors(vRightEar, vLeftEar);
+            const vEarToNose = new THREE.Vector3().subVectors(vNose, vLeftEar);
+
+            // 2つのベクトルの外積（クロス積）を計算して、顔平面の法線ベクトル（正面方向）を求める
+            const normalVector = new THREE.Vector3().crossVectors(vEarToEar, vEarToNose);
+            normalVector.normalize(); // 正規化して単位ベクトル（長さ1のベクトル）にする
+
+            return {
+                startPoint: screenNose,   // 描画開始点 (2D)
+                direction: normalVector  // 顔の正面方向 (3Dベクトル)
+            };
+        }
+
+        function drawGazeIndicator(gazeData, ctx) {
+            const { startPoint, direction } = gazeData;
+            
+            // 描画開始点をキャンバス座標に変換
+            const base = {
+                x: startPoint.x * canvasElement.width,
+                y: startPoint.y * canvasElement.height
+            };
+            
+            const sensitivity = 300; // 線の長さの調整値
+            
+            // 3D方向ベクトルを2Dのオフセットに変換
+            // 3D空間のY軸は上向き、CanvasのY軸は下向きなので、Y成分を反転
+            const dirX = direction.x;
+            const dirY = -direction.y; 
+            
+            const cursor = {
+                x: base.x + dirX * sensitivity,
+                y: base.y + dirY * sensitivity
+            };
+            
+            // ★修正点: この関数内でのsave/restoreやtransformを削除し、描画に専念させる
+            
+            // 直線を描画
+            ctx.beginPath();
+            ctx.moveTo(base.x, base.y);
+            ctx.lineTo(cursor.x, cursor.y);
+            ctx.strokeStyle = 'rgba(14, 165, 233, 0.9)'; // 青
+            ctx.lineWidth = 4;
+            ctx.stroke();
+
+            // 終点の円を描画
+            ctx.beginPath();
+            ctx.arc(cursor.x, cursor.y, 15, 0, 2 * Math.PI);
+            ctx.fillStyle = 'rgba(239, 68, 68, 0.8)'; // 赤
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        }
+
+        // --- MediaPipe Holisticの初期化 ---
+        const holistic = new Holistic({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`
+        });
+        holistic.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            refineFaceLandmarks: true, // 顔のランドマークをより詳細に取得
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        holistic.onResults(onResults);
+        
+        // --- ストリーム制御 ---
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                if(activeStream) await holistic.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+
+        async function startWebcam() {
+            stopAllStreams();
+            isMirrored = true;
+            activeStream = true;
+            statusText.textContent = 'Webカメラを起動中...';
+            await camera.start();
+        }
+
+        function startVideoFile(event) {
+            if (!event.target.files || event.target.files.length === 0) return;
+            stopAllStreams();
+            isMirrored = false;
+            activeStream = true;
+
+            const file = event.target.files[0];
+            const url = URL.createObjectURL(file);
+            videoElement.src = url;
+            videoElement.onloadeddata = () => {
+                videoElement.play();
+                sendVideoFrame();
+            }
+        }
+        
+        async function sendVideoFrame(){
+            if (!activeStream || videoElement.paused || videoElement.ended) {
+                return;
+            };
+            await holistic.send({image: videoElement});
+            requestAnimationFrame(sendVideoFrame);
+        }
+
+        function stopAllStreams() {
+            activeStream = false;
+            videoElement.pause();
+            if (videoElement.srcObject){
+                videoElement.srcObject.getTracks().forEach(track => track.stop());
+            }
+            videoElement.srcObject = null;
+            videoElement.removeAttribute('src');
+        }
+
+        // --- イベントリスナーと初期化 ---
+        webcamButton.addEventListener('click', startWebcam);
+        videoFileInput.addEventListener('change', startVideoFile);
+
+        (async () => {
+            statusText.textContent = 'AIモデルを読み込み中...';
+            await holistic.initialize();
+            statusText.textContent = '準備完了。ソースを選択してください。';
+        })();
+    </script>
+</body>
+</html>

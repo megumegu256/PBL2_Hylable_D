@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>【複数人対応・高精度版】視線・頭部姿勢推定デモ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <style>
+        body {
+            background-color: #111827; /* bg-gray-900 */
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            padding-top: 75%; /* 4:3 Aspect Ratio */
+            background-color: #000;
+            border-radius: 0.5rem;
+            overflow: hidden; /* Ensure overlay and video stay within bounds */
+        }
+        #video, #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border-radius: 0.5rem;
+        }
+        #video.mirrored {
+            transform: scaleX(-1); /* Webcam mirror */
+        }
+        #three-container {
+            min-height: 400px;
+        }
+    </style>
+</head>
+<body class="text-white font-sans">
+
+    <div class="container mx-auto p-4 max-w-7xl">
+        <div class="text-center mb-6">
+            <h1 class="text-3xl md:text-4xl font-bold">【複数人対応・高精度版】視線・頭部姿勢推定デモ</h1>
+            <p class="text-gray-400 mt-2">検出された人物の視線と頭部の動きを、ポリゴンモデルで追跡します。</p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="bg-gray-800 p-4 rounded-lg shadow-2xl">
+                <div class="video-container mb-4 shadow-inner">
+                    <video id="video" playsinline muted loop></video>
+                    <canvas id="overlay"></canvas>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-4">
+                    <button id="webcamButton" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg transition-colors duration-300">Webカメラを開始</button>
+                    <label for="videoFileInput" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition-colors duration-300 cursor-pointer text-center">
+                        動画ファイルを選択
+                    </label>
+                    <input type="file" id="videoFileInput" accept="video/*" class="hidden">
+                </div>
+            </div>
+
+            <div id="three-container" class="bg-gray-800 p-4 rounded-lg shadow-2xl flex items-center justify-center">
+                <p id="status" class="text-gray-400 text-center">モデルを読み込み中...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const webcamButton = document.getElementById('webcamButton');
+        const videoFileInput = document.getElementById('videoFileInput');
+        const threeContainer = document.getElementById('three-container');
+        const statusText = document.getElementById('status');
+        
+        let modelsLoaded = false;
+        let scene, camera, renderer;
+        let detectionLoopId;
+        const SMOOTHING_FACTOR = 0.15;
+        const GAZE_SENSITIVITY = 400;
+
+        // 複数人の顔情報を管理する配列
+        let faces = [];
+
+        // 高性能モデルを読み込むように変更
+        async function loadModels() {
+            const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+            try {
+                // SsdMobilenetv1: 検出精度が高いが、少し重いモデル
+                await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+                // TinyFaceDetector: 高速だが、横顔などの検出は苦手
+                // await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+                await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+                modelsLoaded = true;
+                statusText.textContent = '準備完了。ソースを選択してください。';
+            } catch (error) {
+                console.error("モデルの読み込みに失敗:", error);
+                statusText.textContent = 'モデルの読み込みに失敗しました。';
+            }
+        }
+
+        function initThreeScene() {
+            if (scene) return;
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, threeContainer.clientWidth / threeContainer.clientHeight, 0.1, 1000);
+            camera.position.set(0, 0, 30);
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(threeContainer.clientWidth, threeContainer.clientHeight);
+            threeContainer.innerHTML = '';
+            threeContainer.appendChild(renderer.domElement);
+            
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.9);
+            directionalLight.position.set(0, 1, 1);
+            scene.add(directionalLight);
+            
+            window.addEventListener('resize', onWindowResize, false);
+        }
+        
+        // 68点のランドマークから顔のポリゴンジオメトリを生成する関数
+        function createFaceGeometry() {
+            // 標準的な顔ランドマーク68点の座標（正規化）
+            const positions = [
+                -0.46875,0.1875,-0.125,-0.46875,0.0625,-0.125,-0.4375,-0.0625,-0.125,-0.40625,-0.1875,-0.09375,
+                -0.34375,-0.28125,-0.0625,-0.25,-0.34375,-0.03125,-0.15625,-0.375,-0.03125,
+                -0.0625,-0.375,0,0.0625,-0.375,0,0.15625,-0.375,-0.03125,0.25,-0.34375,-0.03125,
+                0.34375,-0.28125,-0.0625,0.40625,-0.1875,-0.09375,0.4375,-0.0625,-0.125,
+                0.46875,0.0625,-0.125,0.46875,0.1875,-0.125,-0.375,0.25,0.0625,-0.3125,0.28125,0.0625,
+                -0.21875,0.28125,0.0625,-0.15625,0.25,0.0625,0.15625,0.25,0.0625,0.21875,0.28125,0.0625,
+                0.3125,0.28125,0.0625,0.375,0.25,0.0625,0,0.21875,0.09375,0,0.15625,0.09375,
+                0,0.09375,0.09375,0,0.03125,0.09375,-0.09375,0.0625,0.09375,-0.0625,0.0625,0.125,
+                0,0.0625,0.125,0.0625,0.0625,0.125,0.09375,0.0625,0.09375,-0.28125,0.125,0.09375,
+                -0.21875,0.125,0.125,-0.25,0.0625,0.125,-0.15625,0.0625,0.125,0.15625,0.0625,0.125,
+                0.25,0.0625,0.125,0.21875,0.125,0.125,0.28125,0.125,0.09375,-0.1875,-0.0625,0.125,
+                -0.09375,-0.03125,0.125,0,-0.0625,0.15625,0.09375,-0.03125,0.125,0.1875,-0.0625,0.125,
+                0.09375,-0.125,0.125,0,-0.15625,0.15625,-0.09375,-0.125,0.125,-0.125,-0.0625,0.125,
+                0,-0.09375,0.15625,0.125,-0.0625,0.125,0,-0.125,0.15625,-0.0625,-0.09375,0.15625
+            ];
+             // ランドマークの点同士を結ぶインデックス（三角形リスト）
+            const indices = [
+                36,41,37,41,38,37,38,41,40,38,40,39,42,43,47,43,44,47,44,46,47,44,45,46,
+                27,28,29,29,30,27,31,32,33,33,34,35,48,59,58,48,58,49,49,58,57,49,57,50,
+                50,57,56,50,56,51,51,56,55,51,55,52,52,55,54,52,54,53,60,67,61,61,67,66,
+                61,66,62,62,66,65,62,65,63,63,65,64,17,18,27,18,19,27,19,28,27,19,20,28,
+                20,21,28,21,29,28,21,22,29,22,23,29,23,30,29,23,24,30,24,25,30,25,26,30,
+                0,1,17,1,2,17,2,18,17,2,3,18,3,19,18,3,4,19,4,20,19,4,5,20,5,21,20,5,6,21,
+                6,7,21,7,8,21,8,29,21,8,9,29,9,10,29,10,30,29,10,11,30,11,12,30,12,25,30,
+                12,13,25,13,14,25,14,26,25,14,15,26,15,16,26,36,37,27,37,28,27,37,38,28,
+                38,29,28,38,39,29,39,40,29,40,41,29,41,36,27,42,27,28,42,28,29,42,29,43,
+                43,29,30,43,30,44,44,30,25,44,25,45,45,25,26,45,26,47,47,26,46,47,46,42,
+                31,36,41,31,41,40,31,40,32,32,40,39,32,39,33,33,39,38,33,38,37,33,37,36,
+                33,36,31,33,35,31,35,42,47,35,47,46,35,46,34,34,46,45,34,45,44,34,44,43,
+                34,43,42,34,42,35,31,48,36,48,59,36,59,37,36,59,58,37,58,38,37,58,48,38,
+                35,48,42,48,49,42,49,43,42,49,50,43,50,44,43,50,48,44,48,35,44,48,50,51,
+                51,52,58,52,53,58,53,54,58,54,55,58,55,56,58,56,57,58,57,49,58,49,50,58,
+                50,51,58,60,61,67,48,60,67,59,48,58,59,51,58,52,51,57,58,51,56,57,53,54,64,
+                54,63,64,54,62,63,54,61,62,54,60,61,54,48,60,54,53,48,53,64,48,64,65,48,
+                65,66,48,66,67,48
+            ];
+
+            const geometry = new THREE.BufferGeometry();
+            // ジオメトリを-8倍して大きくし、中心を調整
+            const scaledPositions = positions.map((p, i) => {
+                const val = p * -8;
+                if (i % 3 === 1) return val + 3; // y-offset
+                return val;
+            });
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(scaledPositions, 3));
+            geometry.setIndex(indices);
+            geometry.computeVertexNormals();
+            return geometry;
+        }
+
+        // 新しい顔に対応する3Dメッシュオブジェクトを生成する関数
+        function createFaceMeshObject() {
+            const faceGeometry = createFaceGeometry();
+            const faceMaterial = new THREE.MeshStandardMaterial({
+                color: Math.random() * 0xaaaaaa + 0x555555, // ランダムな灰色系の色
+                roughness: 0.4,
+                metalness: 0.1,
+                wireframe: true // ポリゴンをワイヤーフレームで表示
+            });
+            const headMesh = new THREE.Mesh(faceGeometry, faceMaterial);
+            
+            const gazeMaterial = new THREE.LineBasicMaterial({ color: 0x0ea5e9, linewidth: 3 });
+            const gazePoints = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, 50)];
+            const gazeGeometry = new THREE.BufferGeometry().setFromPoints(gazePoints);
+            const gazeLine = new THREE.Line(gazeGeometry, gazeMaterial);
+            headMesh.add(gazeLine);
+
+            scene.add(headMesh);
+
+            return {
+                head: headMesh,
+                gazeLine,
+                smoothedPose: { yaw: 0, pitch: 0, roll: 0 },
+                isFirstPose: true
+            };
+        }
+        
+        function onWindowResize() {
+            if (!renderer) return;
+            camera.aspect = threeContainer.clientWidth / threeContainer.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(threeContainer.clientWidth, threeContainer.clientHeight);
+        }
+
+        webcamButton.addEventListener('click', () => {
+            if (!modelsLoaded) return;
+            video.classList.add('mirrored');
+            startVideo(true);
+        });
+
+        videoFileInput.addEventListener('change', (event) => {
+            if (!modelsLoaded || !event.target.files || event.target.files.length === 0) return;
+            video.classList.remove('mirrored');
+            const file = event.target.files[0];
+            const url = URL.createObjectURL(file);
+            video.src = url;
+            startVideo(false);
+        });
+
+        function startVideo(isWebcam) {
+            const videoSource = isWebcam ? navigator.mediaDevices.getUserMedia({ video: {} }) : Promise.resolve();
+            
+            videoSource.then(stream => {
+                if (isWebcam && stream) {
+                    video.srcObject = stream;
+                }
+                video.play();
+            }).catch(err => {
+                console.error("ビデオの開始に失敗:", err);
+                statusText.textContent = 'ビデオの開始に失敗しました。';
+            });
+        }
+        
+        video.addEventListener('play', () => {
+            initThreeScene();
+            
+            const displaySize = { width: video.clientWidth, height: video.clientHeight };
+            faceapi.matchDimensions(overlay, displaySize);
+
+            if (detectionLoopId) {
+                cancelAnimationFrame(detectionLoopId);
+            }
+            faces.forEach(face => scene.remove(face.head));
+            faces = [];
+            detectionLoop();
+        });
+        
+        async function detectionLoop() {
+            detectionLoopId = requestAnimationFrame(detectionLoop);
+
+            try {
+                if (video.paused || video.ended || !modelsLoaded) {
+                    return;
+                }
+                
+                // SsdMobilenetv1Optionsを使用
+                const detections = await faceapi.detectAllFaces(video, new faceapi.SsdMobilenetv1Options()).withFaceLandmarks();
+                const ctx = overlay.getContext('2d');
+                ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+                ctx.save();
+                if (video.classList.contains('mirrored')) {
+                    ctx.scale(-1, 1);
+                    ctx.translate(-overlay.width, 0);
+                }
+
+                const resizedDetections = faceapi.resizeResults(detections, { width: overlay.width, height: overlay.height });
+                
+                // 検出された顔の数に合わせて3Dオブジェクトを調整
+                while (faces.length > resizedDetections.length) {
+                    const oldFace = faces.pop();
+                    scene.remove(oldFace.head);
+                }
+                while (faces.length < resizedDetections.length) {
+                    faces.push(createFaceMeshObject());
+                }
+
+                // 検出された各顔に対して処理を実行
+                resizedDetections.forEach((detection, i) => {
+                    const face = faces[i];
+                    if (detection && detection.landmarks) {
+                        // ランドマークを描画
+                        faceapi.draw.drawFaceLandmarks(overlay, detection);
+
+                        const pose = estimateHeadPose(detection.landmarks);
+                        
+                        if (pose) {
+                            // スムージング処理
+                            if (face.isFirstPose) {
+                                face.smoothedPose = pose;
+                                face.isFirstPose = false;
+                            } else {
+                                face.smoothedPose.yaw = SMOOTHING_FACTOR * pose.yaw + (1 - SMOOTHING_FACTOR) * face.smoothedPose.yaw;
+                                face.smoothedPose.pitch = SMOOTHING_FACTOR * pose.pitch + (1 - SMOOTHING_FACTOR) * face.smoothedPose.pitch;
+                                face.smoothedPose.roll = SMOOTHING_FACTOR * pose.roll + (1 - SMOOTHING_FACTOR) * face.smoothedPose.roll;
+                            }
+                            
+                            // 3Dモデルの位置と回転を更新
+                            face.head.position.x = (i - (resizedDetections.length - 1) / 2) * 25; // 重ならないようにX軸位置をずらす
+
+                            // Webカメラのミラーリングに合わせて回転方向を調整
+                            if (video.classList.contains('mirrored')) {
+                                face.head.rotation.y = face.smoothedPose.yaw;
+                            } else {
+                                face.head.rotation.y = -face.smoothedPose.yaw;
+                            }
+                            face.head.rotation.x = face.smoothedPose.pitch;
+                            face.head.rotation.z = -face.smoothedPose.roll;
+                            
+                            // 視線を示す赤い丸を描画
+                            drawGazePointOnOverlay(detection.landmarks, face.smoothedPose, ctx);
+                        }
+                    }
+                });
+
+                if (resizedDetections.length === 0) {
+                     faces.forEach(face => face.isFirstPose = true);
+                }
+
+                ctx.restore();
+
+                if(renderer && scene && camera) {
+                    renderer.render(scene, camera);
+                }
+
+            } catch (error) {
+                console.error("Detection loop error:", error);
+            }
+        }
+
+        // ランドマークから頭部の向き（ヨー、ピッチ、ロール）を推定する簡易的な関数
+        function estimateHeadPose(landmarks) {
+            try {
+                // NOTE: この推定は簡易的なもので、正確な3D姿勢推定ではありません。
+                // 顔のランドマークが検出できない場合（例：後頭部）は機能しません。
+                const leftEye = landmarks.getLeftEye();
+                const rightEye = landmarks.getRightEye();
+                const nose = landmarks.getNose();
+                const jaw = landmarks.getJawOutline();
+
+                if (!leftEye || !rightEye || !nose || !jaw || jaw.length < 17 || !leftEye[0] || !rightEye[3] || !nose[3] || !jaw[8] || !jaw[16] || !jaw[0]) {
+                    return null;
+                }
+
+                const eyeMidPoint = { x: (leftEye[0].x + rightEye[3].x) / 2, y: (leftEye[0].y + rightEye[3].y) / 2 };
+                const roll = Math.atan2(rightEye[3].y - leftEye[0].y, rightEye[3].x - leftEye[0].x);
+                const noseTip = nose[3];
+                const chin = jaw[8];
+                const eyeToNoseDist = noseTip.y - eyeMidPoint.y;
+                const noseToChinDist = chin.y - noseTip.y;
+                const pitch = (eyeToNoseDist / (noseToChinDist || 1) - 0.75) * 0.8;
+                const faceWidth = jaw[16].x - jaw[0].x;
+                const noseToCenterDist = noseTip.x - (jaw[0].x + faceWidth / 2);
+                const yaw = Math.PI * (noseToCenterDist / (faceWidth / 2 || 1)) * 0.8;
+                return { yaw, pitch, roll };
+            } catch (e) {
+                console.error("Error in estimateHeadPose", e);
+                return null;
+            }
+        }
+        
+        // オーバーレイ上に視点の目標（赤い丸）を描画する関数
+        function drawGazePointOnOverlay(landmarks, pose, ctx) {
+            const leftEye = landmarks.getLeftEye();
+            const rightEye = landmarks.getRightEye();
+            if(!leftEye || !rightEye || !leftEye[0] || !rightEye[3]) return;
+
+            const eyeMidPoint = {
+                x: (leftEye[0].x + rightEye[3].x) / 2,
+                y: (leftEye[0].y + rightEye[3].y) / 2
+            };
+            
+            // Webカメラのミラーリングに合わせて視点のXオフセットを反転
+            const yawForGaze = video.classList.contains('mirrored') ? pose.yaw : -pose.yaw;
+
+            const offsetX = Math.tan(yawForGaze) * GAZE_SENSITIVITY;
+            const offsetY = Math.tan(pose.pitch) * GAZE_SENSITIVITY;
+            
+            const gazeX = eyeMidPoint.x - offsetX;
+            const gazeY = eyeMidPoint.y + offsetY;
+
+            ctx.beginPath();
+            ctx.arc(gazeX, gazeY, 10, 0, 2 * Math.PI);
+            ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+
+        loadModels();
+    </script>
+</body>
+</html>
