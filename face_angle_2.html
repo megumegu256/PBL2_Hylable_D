@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>リアルタイム顔追跡アバター【最終完成版】</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background-color: #f0f2f5; color: #333; margin: 0; padding: 20px; }
+        .app-container { max-width: 1600px; margin: auto; display: grid; grid-template-columns: 2fr 1fr; gap: 20px; align-items: flex-start; }
+        .column { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        h1, h2, h3, h4 { color: #1a73e8; margin-top: 0; }
+        h4 { margin-bottom: 5px; text-align: center;}
+        #status { color: #555; margin-bottom: 20px; min-height: 20px; font-weight: bold; }
+        .viewer-container { border-radius: 8px; overflow: hidden; border: 1px solid #ddd; }
+        video, canvas { width: 100%; height: auto; display: block; background-color: #000; }
+        .controls { display: flex; flex-direction: column; gap: 15px; }
+        .button-group { display: flex; gap: 10px; }
+        button, label.button { flex: 1; padding: 12px; font-size: 16px; color: white; border: none; border-radius: 5px; cursor: pointer; text-align: center; }
+        #webcamButton { background-color: #1a73e8; }
+        label.button { background-color: #34a853; }
+        #downloadButton { background-color: #ff6f61; }
+        input[type="file"] { display: none; }
+        #angles-display { background-color: #e8f0fe; padding: 15px; border-radius: 5px; font-family: monospace; border-left: 5px solid #1a73e8; }
+        .video-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 20px; }
+        .video-box { border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+    </style>
+</head>
+<body>
+
+    <div style="text-align: center; margin-bottom: 20px;">
+        <h1>リアルタイム顔追跡＆アバター同時再現【完成版】 🚀</h1>
+        <p id="status">AIモデルを読み込んでいます...</p>
+    </div>
+
+    <div class="app-container">
+        <div class="column">
+            <h2>コントロール＆カメラ映像</h2>
+            <div class="controls">
+                <div class="button-group">
+                    <button id="webcamButton">Webカメラ開始</button>
+                    <label for="videoFileInput" class="button">動画ファイル選択</label>
+                    <input type="file" id="videoFileInput" accept="video/*">
+                </div>
+                <button id="downloadButton">今回の記録をCSVでダウンロード</button>
+            </div>
+            <h3 style="margin-top: 20px;">リアルタイム角度 (度)</h3>
+            <div id="angles-display">
+                Yaw (左右): 0.00 <br> Pitch (上下): 0.00 <br> Roll (傾き): 0.00
+            </div>
+            <div class="video-grid">
+                <div><h4>元映像 (Original)</h4><div class="video-box"><video id="input_video" autoplay muted playsinline></video></div></div>
+                <div><h4>メッシュ付き映像 (Processed)</h4><div class="video-box"><canvas id="output_canvas"></canvas></div></div>
+            </div>
+        </div>
+        <div class="column">
+            <h2>アバタービューア</h2>
+            <div class="viewer-container"><canvas id="avatarCanvas"></canvas></div>
+        </div>
+    </div>
+
+<script type="importmap">
+    { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // --- 1. 定数とグローバル変数の定義 ---
+
+    // ランドマークIDに名前を付けて分かりやすくする
+    const LANDMARKS = {
+        FOREHEAD: 10,      // 額
+        CHIN: 152,         // 顎
+        RIGHT_TEMPLE: 234, // 右こめかみ
+        LEFT_TEMPLE: 454,  // 左こめかみ
+    };
+
+    // DOM要素
+    const dom = {
+        statusText: document.getElementById('status'),
+        videoElement: document.getElementById('input_video'),
+        outputCanvas: document.getElementById('output_canvas'),
+        avatarCanvas: document.getElementById('avatarCanvas'),
+        webcamButton: document.getElementById('webcamButton'),
+        videoFileInput: document.getElementById('videoFileInput'),
+        downloadButton: document.getElementById('downloadButton'),
+        anglesDisplay: document.getElementById('angles-display'),
+    };
+
+    // 状態管理
+    let logData = [];
+    let avatarNode = null;
+
+    // Three.jsの再利用オブジェクト (パフォーマンス最適化)
+    const three = {
+        scene: new THREE.Scene(),
+        camera: new THREE.PerspectiveCamera(50, 640 / 480, 0.1, 1000),
+        renderer: new THREE.WebGLRenderer({ canvas: dom.avatarCanvas, antialias: true }),
+        controls: null, // 初期化時に設定
+        matrix: new THREE.Matrix4(),
+        baseRotation: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, Math.PI)),
+        faceRotation: new THREE.Quaternion(),
+    };
+
+    // MediaPipeインスタンス
+    const faceMesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+    const mediaPipeCamera = new Camera(dom.videoElement, {
+        onFrame: async () => await faceMesh.send({ image: dom.videoElement }),
+        width: 640, height: 480
+    });
+
+    // --- 2. 初期設定関数 ---
+
+    /** Three.jsのシーンをセットアップする */
+    function setupThreeScene() {
+        three.scene.background = new THREE.Color(0xdddddd);
+        three.camera.position.set(0, 1.2, 2.5);
+        three.renderer.setSize(640, 480);
+        three.controls = new OrbitControls(three.camera, three.renderer.domElement);
+        three.controls.target.set(0, 1.0, 0);
+        
+        three.scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        directionalLight.position.set(1, 2, 3);
+        three.scene.add(directionalLight);
+
+        const modelData = { "metadata": { "version": 4.5, "type": "Object" }, "geometries": [{ "uuid": "head_geom", "type": "SphereGeometry", "radius": 0.4, "widthSegments": 32, "heightSegments": 16 },{ "uuid": "neck_geom", "type": "CylinderGeometry", "radiusTop": 0.15, "radiusBottom": 0.15, "height": 0.4 },{ "uuid": "nose_geom", "type": "BoxGeometry", "width": 0.1, "height": 0.1, "depth": 0.15 }], "materials": [{ "uuid": "face_mat", "type": "MeshStandardMaterial", "color": "0xeeeeee", "roughness": 0.5 },{ "uuid": "neck_mat", "type": "MeshStandardMaterial", "color": "0xcccccc", "roughness": 0.5 },{ "uuid": "nose_mat", "type": "MeshStandardMaterial", "color": "0xffa500" }], "object": { "uuid": "avatarNode", "type": "Group", "position": [0, 0.8, 0], "children": [{ "uuid": "head", "type": "Mesh", "geometry": "head_geom", "material": "face_mat", "position": [0, 0.4, 0] },{ "uuid": "neck", "type": "Mesh", "geometry": "neck_geom", "material": "neck_mat", "position": [0, -0.05, 0] },{ "uuid": "nose", "type": "Mesh", "geometry": "nose_geom", "material": "nose_mat", "position": [0, 0.4, 0.4] }]}};
+        avatarNode = new THREE.ObjectLoader().parse(modelData);
+        avatarNode.rotation.z = Math.PI; // 初期向きを180度回転
+        three.scene.add(avatarNode);
+    }
+
+    /** MediaPipeをセットアップする */
+    function setupMediaPipe() {
+        faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        faceMesh.onResults(onMediaPipeResults);
+    }
+
+    // --- 3. イベントリスナーの設定 ---
+
+    function setupEventListeners() {
+        dom.webcamButton.addEventListener('click', startWebcam);
+        dom.videoFileInput.addEventListener('change', startVideoFile);
+        dom.downloadButton.addEventListener('click', downloadCSV);
+    }
+
+    // --- 4. メインロジック ---
+
+    /** MediaPipeから結果が返されたときの処理 */
+    function onMediaPipeResults(results) {
+        const canvasCtx = dom.outputCanvas.getContext('2d');
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, dom.outputCanvas.width, dom.outputCanvas.height);
+        canvasCtx.drawImage(results.image, 0, 0, dom.videoElement.videoWidth, dom.videoElement.videoHeight);
+
+        if (results.multiFaceLandmarks && results.multiFaceLandmarks[0]) {
+            drawConnectors(canvasCtx, results.multiFaceLandmarks[0], FACEMESH_TESSELATION, { color: '#C0C0C070', lineWidth: 1 });
+            const angles = calculateFaceAngles(results.multiFaceLandmarks[0]);
+            if (angles) {
+                updateDisplays(angles);
+                updateAvatarPose(angles);
+            }
+        }
+        canvasCtx.restore();
+    }
+    
+    /** ランドマークから顔の角度を計算する */
+    function calculateFaceAngles(landmarks) {
+        const p1 = new THREE.Vector3(landmarks[LANDMARKS.FOREHEAD].x, landmarks[LANDMARKS.FOREHEAD].y, landmarks[LANDMARKS.FOREHEAD].z);
+        const p2 = new THREE.Vector3(landmarks[LANDMARKS.CHIN].x, landmarks[LANDMARKS.CHIN].y, landmarks[LANDMARKS.CHIN].z);
+        const p3 = new THREE.Vector3(landmarks[LANDMARKS.RIGHT_TEMPLE].x, landmarks[LANDMARKS.RIGHT_TEMPLE].y, landmarks[LANDMARKS.RIGHT_TEMPLE].z);
+        const p4 = new THREE.Vector3(landmarks[LANDMARKS.LEFT_TEMPLE].x, landmarks[LANDMARKS.LEFT_TEMPLE].y, landmarks[LANDMARKS.LEFT_TEMPLE].z);
+
+        const upVec = new THREE.Vector3().subVectors(p1, p2);
+        const rightVec = new THREE.Vector3().subVectors(p3, p4);
+        const forwardVec = new THREE.Vector3().crossVectors(rightVec, upVec).normalize();
+        const rightVecNorm = rightVec.clone().normalize();
+        const upVecNorm = new THREE.Vector3().crossVectors(forwardVec, rightVecNorm).normalize();
+        
+        three.matrix.makeBasis(rightVecNorm, upVecNorm, forwardVec);
+        const euler = new THREE.Euler().setFromRotationMatrix(three.matrix, 'YXZ');
+
+        return {
+            yaw: euler.y * (180 / Math.PI),
+            pitch: euler.x * (180 / Math.PI) * -1,
+            roll: euler.z * (180 / Math.PI) * -1,
+        };
+    }
+
+    /** アバターの姿勢を更新する (最適化版) */
+    function updateAvatarPose(angles) {
+        if (!avatarNode) return;
+        
+        three.faceRotation.setFromEuler(new THREE.Euler(
+            THREE.MathUtils.degToRad(angles.pitch),
+            THREE.MathUtils.degToRad(angles.yaw),
+            THREE.MathUtils.degToRad(angles.roll),
+            'YXZ'
+        ));
+
+        avatarNode.quaternion.copy(three.baseRotation).multiply(three.faceRotation);
+    }
+
+    /** 画面の角度表示を更新し、データを記録する */
+    function updateDisplays(angles) {
+        dom.anglesDisplay.innerHTML = `Yaw (左右): ${angles.yaw.toFixed(2)} <br> Pitch (上下): ${angles.pitch.toFixed(2)} <br> Roll (傾き): ${angles.roll.toFixed(2)}`;
+        logData.push({ time: new Date().toLocaleTimeString(), yaw: angles.yaw.toFixed(2), pitch: angles.pitch.toFixed(2), roll: angles.roll.toFixed(2) });
+    }
+    
+    // --- 5. コントロール関数 ---
+
+    function startWebcam() {
+        dom.statusText.textContent = 'Webカメラを起動中...';
+        dom.videoElement.srcObject = null;
+        dom.videoElement.removeAttribute('src');
+        dom.videoElement.play();
+        mediaPipeCamera.start();
+    }
+
+    function startVideoFile(event) {
+        if (dom.videoElement.srcObject) {
+            dom.videoElement.srcObject.getTracks().forEach(track => track.stop());
+        }
+        const file = event.target.files[0];
+        if (!file) return;
+        const url = URL.createObjectURL(file);
+        dom.videoElement.src = url;
+        dom.videoElement.onloadedmetadata = () => {
+            dom.videoElement.play();
+            dom.statusText.textContent = '動画ファイルを再生中...';
+            processVideoFrameLoop();
+        }
+    }
+
+    function downloadCSV() {
+        if (logData.length === 0) { alert('記録されたデータがありません。'); return; }
+        let csvContent = "data:text/csv;charset=utf-8,Time,Yaw,Pitch,Roll\r\n";
+        logData.forEach(row => { csvContent += `${row.time},${row.yaw},${row.pitch},${row.roll}\r\n`; });
+        const link = document.createElement("a");
+        link.href = encodeURI(csvContent);
+        link.download = "face_angle_log.csv";
+        link.click();
+    }
+
+    // --- 6. アニメーションループ ---
+
+    /** Three.jsのレンダリングループ */
+    function renderThreeLoop() {
+        requestAnimationFrame(renderThreeLoop);
+        three.controls.update();
+        three.renderer.render(three.scene, three.camera);
+    }
+
+    /** 動画ファイル用の処理ループ */
+    async function processVideoFrameLoop() {
+        if (dom.videoElement.paused || dom.videoElement.ended) return;
+        await faceMesh.send({ image: dom.videoElement });
+        requestAnimationFrame(processVideoFrameLoop);
+    }
+
+    // --- 7. 初期化と実行 ---
+
+    (async () => {
+        dom.statusText.textContent = '初期化中...';
+        setupThreeScene();
+        setupMediaPipe();
+        setupEventListeners();
+        renderThreeLoop();
+        await faceMesh.initialize();
+        dom.statusText.textContent = '準備完了。Webカメラまたは動画を選択してください。';
+    })();
+</script>
+</body>
+</html>

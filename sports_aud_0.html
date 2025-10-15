@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>顔トラッキングとメッシュ描画 (修正版)</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        h1 {
+            color: #333;
+        }
+        #container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            border: 2px solid #ccc;
+            background-color: #000;
+        }
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #status {
+            margin-top: 15px;
+            font-size: 1.2em;
+            color: #555;
+            min-height: 1.5em; /* メッセージの有無でレイアウトが崩れないようにする */
+        }
+        input[type="file"] {
+            margin-bottom: 15px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>スポーツ選手の顔トラッキング＆メッシュ描画</h1>
+    <p>動画ファイルを選択すると、顔を認識してメッシュを表示します。</p>
+
+    <input type="file" id="video-input" accept="video/*">
+
+    <div id="container">
+        <video id="video" autoplay muted loop playsinline style="display: none;"></video>
+        <canvas id="canvas"></canvas>
+    </div>
+    
+    <div id="status">モデルを読み込んでいます...</div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection"></script>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const videoInput = document.getElementById('video-input');
+        const statusDiv = document.getElementById('status');
+        let detector;
+
+        async function setupFaceDetection() {
+            await tf.setBackend('webgl');
+            
+            const model = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
+            const detectorConfig = {
+                runtime: 'mediapipe',
+                // 【修正点2】 solutionPathを削除し、直接読み込んだライブラリを使わせる
+                // solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh', 
+                maxFaces: 5 
+            };
+            detector = await faceLandmarksDetection.createDetector(model, detectorConfig);
+            statusDiv.textContent = '準備完了です。動画ファイルを選択してください。';
+        }
+
+        async function render() {
+            if (!detector || video.paused || video.ended) {
+                requestAnimationFrame(render);
+                return;
+            }
+
+            const faces = await detector.estimateFaces(video, {flipHorizontal: false});
+            
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (faces.length > 0) {
+                statusDiv.textContent = `${faces.length}人の顔を検出中...`;
+                for (const face of faces) {
+                    drawFaceMesh(face.keypoints);
+                }
+            } else {
+                statusDiv.textContent = '顔を検出できません。';
+            }
+
+            requestAnimationFrame(render);
+        }
+
+        // 【修正点3】メッシュ描画のロジックを、より安定したTRIANGULATION方式に変更
+        function drawFaceMesh(keypoints) {
+            ctx.strokeStyle = 'lime';
+            ctx.lineWidth = 0.5;
+
+            // keypointsのインデックス番号を指定して三角形を描画する
+            for (let i = 0; i < faceLandmarksDetection.TRIANGULATION.length / 3; i++) {
+                const points = [
+                    faceLandmarksDetection.TRIANGULATION[i * 3],
+                    faceLandmarksDetection.TRIANGULATION[i * 3 + 1],
+                    faceLandmarksDetection.TRIANGULATION[i * 3 + 2],
+                ].map(index => keypoints[index]);
+
+                drawPath(points);
+            }
+        }
+
+        function drawPath(points) {
+            const region = new Path2D();
+            region.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < points.length; i++) {
+                const point = points[i];
+                region.lineTo(point.x, point.y);
+            }
+            region.closePath();
+            ctx.stroke(region);
+        }
+        
+        videoInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                const url = URL.createObjectURL(file);
+                video.src = url;
+                video.style.display = 'block';
+
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    video.play();
+                    render();
+                };
+            }
+        });
+
+        window.addEventListener('load', setupFaceDetection);
+
+    </script>
+</body>
+</html>

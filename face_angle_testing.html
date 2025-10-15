@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>【シンプル版】CSVデータで動かす2D顔パネル</title>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            margin: 0;
+            background-color: #f0f2f5;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        .container {
+            background-color: white;
+            padding: 20px 30px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        /* 顔パネルを立体的に見せるためのステージ */
+        #stage {
+            width: 300px;
+            height: 300px;
+            margin: 20px auto;
+            border: 2px dashed #ccc;
+            border-radius: 8px;
+            /* この perspective が奥行きを生み出し、X軸・Y軸回転を立体的に見せるための鍵です */
+            perspective: 800px;
+        }
+
+        /* 動かす顔パネル本体 */
+        #face-panel {
+            width: 100%;
+            height: 100%;
+            background-color: #1a73e8;
+            border-radius: 50%; /* 円形にする */
+            position: relative;
+            /* 動きを滑らかにするための transition */
+            transition: transform 0.1s linear;
+            /* 3D変形を有効にする */
+            transform-style: preserve-3d;
+        }
+
+        /* 顔のパーツ（目と口）で向きを分かりやすくする */
+        .eye {
+            width: 40px;
+            height: 40px;
+            background: white;
+            border-radius: 50%;
+            position: absolute;
+            top: 90px;
+        }
+        #eye-l { left: 70px; }
+        #eye-r { right: 70px; }
+        
+        #mouth {
+            width: 100px;
+            height: 40px;
+            background: white;
+            border-radius: 0 0 50px 50px; /* 下半分が丸い形 */
+            position: absolute;
+            bottom: 60px;
+            left: 100px;
+        }
+
+        label {
+            display: inline-block;
+            padding: 10px 20px;
+            background-color: #34a853;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        label:hover {
+            background-color: #2c8e45;
+        }
+        input[type="file"] {
+            display: none;
+        }
+        #status {
+            margin-top: 15px;
+            font-weight: bold;
+            color: #555;
+            min-height: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>CSVデータで動かす2D顔パネル</h1>
+        <p>顔の角度を記録したCSVファイルを読み込ませてください。</p>
+        
+        <div id="stage">
+            <div id="face-panel">
+                <div class="eye" id="eye-l"></div>
+                <div class="eye" id="eye-r"></div>
+                <div id="mouth"></div>
+            </div>
+        </div>
+
+        <label for="csvFileInput">CSVファイルを選択</label>
+        <input type="file" id="csvFileInput" accept=".csv">
+        <div id="status">CSVファイルが選択されていません。</div>
+    </div>
+
+    <script>
+        // --- 1. 要素の準備 ---
+        const csvFileInput = document.getElementById('csvFileInput');
+        const facePanel = document.getElementById('face-panel');
+        const statusElement = document.getElementById('status');
+        
+        let animationData = [];
+        let currentFrameIndex = 0;
+        
+        // --- 2. ファイルが選択されたときの処理 ---
+        csvFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                // 読み込んだテキストをCSVとして解析
+                parseCSV(e.target.result);
+                statusElement.textContent = `読込完了: ${animationData.length} フレーム。アニメーションを開始します。`;
+                // アニメーションを開始
+                startAnimation();
+            };
+            reader.readAsText(file);
+        });
+
+        // --- 3. CSVテキストを解析してデータ配列に変換 ---
+        function parseCSV(csvText) {
+            const lines = csvText.trim().split('\n');
+            lines.shift(); // ヘッダー行("Time,Yaw,Pitch,Roll")を削除
+            
+            animationData = lines.map(line => {
+                const values = line.split(',');
+                return {
+                    yaw: parseFloat(values[1]),
+                    pitch: parseFloat(values[2]),
+                    roll: parseFloat(values[3])
+                };
+            });
+        }
+
+        // --- 4. アニメーションの制御 ---
+        function startAnimation() {
+            currentFrameIndex = 0;
+            // animate関数を呼び出してループを開始
+            requestAnimationFrame(animate);
+        }
+        
+        function animate() {
+            // データがなければ何もしない
+            if (animationData.length === 0) return;
+
+            // 最後のフレームまで再生したら、最初に戻ってループする
+            if (currentFrameIndex >= animationData.length) {
+                currentFrameIndex = 0;
+            }
+
+            // 現在のフレームの角度データを取得
+            const frameData = animationData[currentFrameIndex];
+            
+            // ★★★ ここが一番のポイント ★★★
+            // CSSのtransformプロパティを使って、顔パネルの角度を一括で設定
+            // rotateYがヨー(左右)、rotateXがピッチ(上下)、rotateZがロール(傾き)に対応
+            facePanel.style.transform = `
+                rotateY(${frameData.yaw}deg) 
+                rotateX(${frameData.pitch}deg) 
+                rotateZ(${frameData.roll}deg)
+            `;
+            
+            // 次のフレームへ進む
+            currentFrameIndex++;
+
+            // 次の描画タイミングで、再びanimate関数を呼び出す
+            requestAnimationFrame(animate);
+        }
+    </script>
+</body>
+</html>

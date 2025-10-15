@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>顔の角度トラッキング＆データ記録（操作ボタン付き）</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            background-color: #f0f2f5;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h1 {
+            color: #1a73e8;
+            margin-bottom: 10px;
+        }
+        #status {
+            color: #555;
+            margin-bottom: 20px;
+            min-height: 20px;
+        }
+        .main-content {
+            display: flex;
+            gap: 20px;
+            width: 100%;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            max-width: 640px;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        #output_canvas {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .controls, .data-section {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 400px;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+        }
+        button, label.button {
+            flex: 1;
+            padding: 12px 15px;
+            font-size: 16px;
+            font-weight: bold;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-align: center;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        #webcamButton { background-color: #1a73e8; }
+        #webcamButton:hover:not(:disabled) { background-color: #155ab3; }
+        label.button { background-color: #34a853; }
+        label.button:hover { background-color: #2c8e45; }
+        #downloadButton { background-color: #ff6f61; }
+        #downloadButton:hover:not(:disabled) { background-color: #e65a50; }
+        #playButton { background-color: #4285f4; }
+        #playButton:hover:not(:disabled) { background-color: #357ae8; }
+        #pauseButton { background-color: #fbbc05; }
+        #pauseButton:hover:not(:disabled) { background-color: #f2a600; }
+        #stopButton { background-color: #ea4335; }
+        #stopButton:hover:not(:disabled) { background-color: #d93025; }
+
+        input[type="file"] { display: none; }
+        
+        #angles-display {
+            background-color: #e8f0fe;
+            padding: 15px;
+            border-radius: 5px;
+            border-left: 5px solid #1a73e8;
+        }
+        .log-container {
+            width: 100%;
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        #log-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        #log-table th, #log-table td {
+            padding: 8px 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        #log-table th {
+            background-color: #f8f9fa;
+            position: sticky;
+            top: 0;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>顔の角度トラッキング＆データ記録 🧑‍💻</h1>
+        <p id="status">AIモデルを読み込んでいます...</p>
+
+        <div class="main-content">
+            <div class="video-container">
+                <video id="input_video" style="display: none;"></video>
+                <canvas id="output_canvas"></canvas>
+            </div>
+
+            <div class="data-section">
+                <div class="controls">
+                    <h2>コントロールパネル</h2>
+                    <div class="button-group">
+                        <button id="webcamButton">Webカメラ</button>
+                        <label for="videoFileInput" class="button">動画選択</label>
+                        <input type="file" id="videoFileInput" accept="video/*">
+                    </div>
+                    <div class="button-group">
+                        <button id="playButton" disabled>▶ 再生/再開</button>
+                        <button id="pauseButton" disabled>❚❚ 一時停止</button>
+                        <button id="stopButton" disabled>■ 終了＆リセット</button>
+                    </div>
+                    <button id="downloadButton">データをCSVでダウンロード</button>
+                </div>
+                
+                <div>
+                    <h2>リアルタイム角度 (度)</h2>
+                    <div id="angles-display">
+                        Yaw (左右): 0.00 <br>
+                        Pitch (上下): 0.00 <br>
+                        Roll (傾き): 0.00
+                    </div>
+                </div>
+
+                <div>
+                    <h2>記録データ</h2>
+                    <div class="log-container">
+                        <table id="log-table">
+                            <thead>
+                                <tr>
+                                    <th>時刻</th>
+                                    <th>Yaw</th>
+                                    <th>Pitch</th>
+                                    <th>Roll</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script type="module">
+    // --- 1. 基本的な要素の準備 ---
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const statusText = document.getElementById('status');
+    const webcamButton = document.getElementById('webcamButton');
+    const videoFileInput = document.getElementById('videoFileInput');
+    const downloadButton = document.getElementById('downloadButton');
+    const anglesDisplay = document.getElementById('angles-display');
+    const logTableBody = document.querySelector('#log-table tbody');
+    // ★★★ 追加したボタン要素 ★★★
+    const playButton = document.getElementById('playButton');
+    const pauseButton = document.getElementById('pauseButton');
+    const stopButton = document.getElementById('stopButton');
+
+    let logData = [];
+    let activeStream = false;
+
+    // --- 2. 顔の角度を計算する関数 (変更なし) ---
+    function calculateFaceAngles(landmarks) {
+        if (!landmarks || landmarks.length === 0) return null;
+        const p1 = landmarks[1], p152 = landmarks[152], p33 = landmarks[33], p263 = landmarks[263];
+        const roll = Math.atan2(p263.y - p33.y, p263.x - p33.x);
+        const pitch = Math.atan2(p1.y - p152.y, Math.sqrt(Math.pow(p1.x - p152.x, 2) + Math.pow(p1.z - p152.z, 2)));
+        const yaw = Math.atan2(p263.x - p33.x, p263.z - p33.z);
+        return {
+            yaw: yaw * (180 / Math.PI),
+            pitch: pitch * (180 / Math.PI) * -1,
+            roll: roll * (180 / Math.PI)
+        };
+    }
+
+    // --- 3. MediaPipeから結果を受け取ったときの処理 (変更なし) ---
+    function onResults(results) {
+        statusText.textContent = '顔を検出中...';
+        canvasElement.width = videoElement.videoWidth;
+        canvasElement.height = videoElement.videoHeight;
+        
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+            for (const landmarks of results.multiFaceLandmarks) {
+                drawConnectors(canvasCtx, landmarks, FACEMESH_TESSELATION, { color: '#C0C0C070', lineWidth: 1 });
+            }
+            const angles = calculateFaceAngles(results.multiFaceLandmarks[0]);
+            if (angles) {
+                anglesDisplay.innerHTML = `Yaw (左右): ${angles.yaw.toFixed(2)} <br>Pitch (上下): ${angles.pitch.toFixed(2)} <br>Roll (傾き): ${angles.roll.toFixed(2)}`;
+                const newRecord = { time: new Date().toLocaleTimeString(), yaw: angles.yaw.toFixed(2), pitch: angles.pitch.toFixed(2), roll: angles.roll.toFixed(2) };
+                logData.push(newRecord);
+                const newRow = logTableBody.insertRow(0);
+                newRow.innerHTML = `<td>${newRecord.time}</td><td>${newRecord.yaw}</td><td>${newRecord.pitch}</td><td>${newRecord.roll}</td>`;
+            }
+        }
+        canvasCtx.restore();
+    }
+
+    // --- 4. MediaPipe Face Mesh の初期化 (変更なし) ---
+    const faceMesh = new FaceMesh({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+    });
+    faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    faceMesh.onResults(onResults);
+
+    // --- 5. カメラや動画の制御 (変更・追加あり) ---
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            if (activeStream) await faceMesh.send({ image: videoElement });
+        },
+        width: 640, height: 480
+    });
+
+    function startWebcam() {
+        stopAllStreams();
+        activeStream = true;
+        statusText.textContent = 'Webカメラを起動中...';
+        setPlaybackButtonsState(false); // 再生ボタンを無効化
+        camera.start();
+    }
+    
+    function startVideoFile(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        stopAllStreams();
+        const url = URL.createObjectURL(file);
+        videoElement.src = url;
+        videoElement.onloadeddata = () => {
+            statusText.textContent = '動画の準備ができました。「再生/再開」ボタンを押してください。';
+            setPlaybackButtonsState(true, false); // 再生ボタンを有効化
+        };
+    }
+    
+    async function sendVideoFrame() {
+        if (!activeStream || videoElement.paused || videoElement.ended) return;
+        await faceMesh.send({ image: videoElement });
+        requestAnimationFrame(sendVideoFrame); // 次のフレームをリクエスト
+    }
+    
+    function stopAllStreams() {
+        activeStream = false;
+        videoElement.pause();
+        if (videoElement.srcObject) {
+            videoElement.srcObject.getTracks().forEach(track => track.stop());
+            videoElement.srcObject = null;
+        }
+        videoElement.removeAttribute('src');
+        setPlaybackButtonsState(false); // 全ての再生ボタンを無効化
+    }
+    
+    // ★★★ 追加: 再生コントロールボタンの状態を管理する関数 ★★★
+    function setPlaybackButtonsState(canPlay, isPlaying = false) {
+        playButton.disabled = !canPlay || isPlaying;
+        pauseButton.disabled = !canPlay || !isPlaying;
+        stopButton.disabled = !canPlay;
+    }
+
+    // ★★★ 追加: 再生コントロールのロジック ★★★
+    function handlePlay() {
+        activeStream = true;
+        videoElement.play();
+        sendVideoFrame();
+        statusText.textContent = '測定中...';
+        setPlaybackButtonsState(true, true);
+    }
+    
+    function handlePause() {
+        activeStream = false;
+        videoElement.pause();
+        statusText.textContent = '一時停止中。「再生/再開」で測定を続行できます。';
+        setPlaybackButtonsState(true, false);
+    }
+    
+    function handleStop() {
+        stopAllStreams();
+        logData = [];
+        logTableBody.innerHTML = '';
+        anglesDisplay.innerHTML = 'Yaw (左右): 0.00 <br>Pitch (上下): 0.00 <br>Roll (傾き): 0.00';
+        statusText.textContent = '測定を終了しました。新しいソースを選択してください。';
+    }
+
+    // --- 6. CSVダウンロード機能 (変更なし) ---
+    function downloadCSV() {
+        if (logData.length === 0) {
+            alert('記録されたデータがありません。');
+            return;
+        }
+        let csvContent = "data:text/csv;charset=utf-8,Time,Yaw,Pitch,Roll\r\n";
+        logData.forEach(row => { csvContent += `${row.time},${row.yaw},${row.pitch},${row.roll}\r\n`; });
+        const encodedUri = encodeURI(csvContent);
+        const link = document.createElement("a");
+        link.setAttribute("href", encodedUri);
+        link.setAttribute("download", "face_angle_log.csv");
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+
+    // --- 7. イベントリスナーの設定 ---
+    webcamButton.addEventListener('click', startWebcam);
+    videoFileInput.addEventListener('change', startVideoFile);
+    downloadButton.addEventListener('click', downloadCSV);
+    // ★★★ 追加したボタンのイベントリスナー ★★★
+    playButton.addEventListener('click', handlePlay);
+    pauseButton.addEventListener('click', handlePause);
+    stopButton.addEventListener('click', handleStop);
+
+    (async () => {
+        await faceMesh.initialize();
+        statusText.textContent = '準備完了。Webカメラまたは動画を選択してください。';
+    })();
+
+</script>
+</body>
+</html>
